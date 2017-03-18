@@ -1,0 +1,13 @@
+name: crystal-hash
+version: 0.1.0
+
+authors:
+  - Linus Sellberg <sellberg@gmail.com>
+
+targets:
+  crystal-hash:
+    main: src/crystal-hash.cr
+
+crystal: 0.21.1
+
+license: MIT
