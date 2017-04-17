@@ -6,13 +6,22 @@ class Hash2b(K, V)
   getter first : Int32?
   getter last : Int32?
 
-  record(Entry, hash : Int32, key : K, value : V)
+  protected getter entries
+  protected getter bins
+
+  record(Entry, hash : Int32, key : K, value : V) do
+    def eq?(o_key : K, o_hash : Int32)
+      hash == o_hash && key == o_key
+    end
+  end
 
   struct Bins
-    EMPTY           = 0
-    DELETED         = 1
-    BASE            = 2
-    UNDEFINED_INDEX = ~0
+    EMPTY     = 0
+    DELETED   = 1
+    BASE      = 2
+    UNDEFINED = ~0
+
+    ENTRY_BASE = 2
 
     property bins : Slice(Int32)
 
@@ -33,35 +42,115 @@ class Hash2b(K, V)
     end
 
     def mark_deleted(i : Int32)
-      assert i != UNDEFINED_INDEX
+      assert i != UNDEFINED
       assert !empty_or_deleted?(i)
-      set_bin(i, DELETED)
+      set_bin(i, DELETED, 0)
     end
 
     def mark_empty(i : Int32)
-      set_bin(i, EMPTY)
+      set_bin(i, EMPTY, 0)
     end
 
     # TODO: ruby version uses variable index sizes depending on size
     # of bin table. Should that be done here as well?
-    def set_bin(n, v)
-      bins[n] = v
+    def set_bin(n, v, offset = ENTRY_BASE)
+      bins[n] = v + offset
+    end
+
+    def get_bin(n, offset = ENTRY_BASE)
+      bins[n] - offset
     end
 
     def bin_count
       bins.size
     end
 
-    def bins_mask
+    def mask
       bin_count - 1
     end
 
-    def hash_bin(hash)
-      hash & bins_mask
+    def bin_hash(hash)
+      hash & mask
     end
 
     def clear
       @bins.clear
+    end
+
+    # Find index of bin and entry for key and hash. If there is no such bin,
+    # return {Bin::UNDEFINED, Entries::UNDEFINED}
+    def index(key : K, hash : Int32, entries : Entries)
+      index = bin_hash(hash)
+      perturb = hash
+      loop do
+        if !empty_or_deleted?(index)
+          entry_index = get_bin(index)
+          entry = entries[entry_index]
+          return {entry_index, index} if entry.eq?(hash, key)
+        elsif empty?(index)
+          return {bin: Bin::UNDEFINED, entries: Entries::UNDEFINED}
+        end
+        index, perturb = secondary_hash(index, perturb)
+      end
+    end
+
+    # Finds the next unused index for key.
+    def unused_index(key : K, hash : Int32, entries : Entries)
+      index = bin_hash(hash)
+      perturb = hash
+      until empty_or_deleted?(index)
+        index, perturb = secondary_hash(index, perturb)
+      end
+      index
+    end
+
+    # Return index for HASH and KEY in bin and entry tables. Reserve
+    # the bin for inclusion of the corresponding entry into the table
+    # if it is not there yet. We always find such bin as bins array
+    # length is bigger entries array. Although we can reuse a deleted
+    # bin, the result bin value is always empty if the table has no
+    # entry with KEY. Return the entries array index of the found
+    # entry or Entries::UNDEFINED if it is not found.
+    def reserve_index(key : K, hash : Int32, entries : Entries)
+      index = bin_hash(hash)
+      perturb = hash
+      first_deleted = UNDEFINED
+      loop do
+        entry_index = get_bin(index)
+        if empty?(index)
+          # num_entries++ ? Need @size
+          entry_index = Entries::UNDEFINED
+          if first_deleted != UNDEFINED
+            # we can reuse a deleted index
+            index = first_deleted
+            mark_empty(index)
+          end
+          return {entry_index, index}
+        elsif !deleted?(index)
+          if entries[entry_index].eq?(key, hash)
+            return {entry_index, index}
+          end
+        elsif first_deleted == UNDEFINED
+          first_deleted = index
+        end
+        index, perturb = secondary_hash(index, perturb)
+      end
+    end
+
+    # Return the next secondary hash index for table TAB using previous
+    #  index INDEX and PERTURB.  Finally modulo of the function becomes a
+    #  full *cycle linear congruential generator*, in other words it
+    #  guarantees traversing all table bins in extreme case.
+    #  According the Hull-Dobell theorem a generator
+    #  "Xnext = (a*Xprev + c) mod m" is a full cycle generator iff
+    #    o m and c are relatively prime
+    #    o a-1 is divisible by all prime factors of m
+    #    o a-1 is divisible by 4 if m is divisible by 4.
+    #  For our case a is 5, c is 1, and m is a power of two.
+    private def secondary_hash(index, perturb)
+      perturb >>= 11
+      index = (index << 2) + index + perturb + 1
+      {bin_hash(index), perturb}
     end
   end
 
@@ -70,12 +159,15 @@ class Hash2b(K, V)
     property starts_at
     property stops_at
 
-    UNDEFINED_INDEX = ~0
+    UNDEFINED = ~0
 
     def initialize(size)
       @entries = Slice(Entry).new(size)
       @starts_at = 0
       @stops_at = 0
+    end
+
+    def initialize(@entries, @starts_at, @stops_at)
     end
 
     def mark_deleted(i)
@@ -87,11 +179,34 @@ class Hash2b(K, V)
     end
 
     def size
+      # FIXME
       entries.size
     end
 
     def clear
       @starts_at = @stops_at = 0
+    end
+
+    # linear search, used for small tables.
+    def index(hash, key)
+      starts_at.upto(stops_at) do |i|
+        return i if entries[i].eq?(hash, key)
+      end
+      UNDEFINED
+    end
+
+    def each
+      starts_at.upto(stops_at) do |i|
+        yield entries[i] unless deleted?(i)
+      end
+    end
+
+    def [](i)
+      entries[i]
+    end
+
+    def []=(i, entry : Entry)
+      entries[i] = entry
     end
   end
 
@@ -109,17 +224,16 @@ class Hash2b(K, V)
     @entries = Entries.new(allocated_entries)
   end
 
-  private def allocated_entries
-    1 << entry_power
-  end
-
-  def []=(key : K, value : V)
-  end
-
-  def delete(key)
-  end
-
-  def each : Nil
+  private def lookup(key : K)
+    hash = do_hash(key)
+    index = if (bins = @bins)
+              bins.index(key, hash, entries)[:entries]
+            else
+              entries.index(key, hash)
+            end
+    found = index == Entries::UNDEFINED
+    entry = found ? nil : entries[index]
+    {found, entry.value}
   end
 
   private def make_empty
@@ -136,16 +250,23 @@ class Hash2b(K, V)
 
   def rehash
     bound = entries.stops_at
-    current_allocation = allocated_entries
-    if (2 * size <= current_allocation &&
+    if (2 * size <= allocated_entries &&
        REBUILD_THRESHOLD * @size > allocated_entries) ||
        @size < 1 << MINIMAL_POWER2
       # compaction
       @size = 0
       @bins.clear if @bins
-      # FIXME
+      new_tab = self
+      new_entries = entries
     else
-      # FIXME
+      new_tab = self.class.new(nil, 2 * @size - 1)
+      new_entries = new_tab.entries
+    end
+    new_index = 0
+    bins = new_hash.bins
+    entries.starts_at.upto(bound) do |i|
+      entry = entries[i]
+      entries
     end
   end
 
@@ -153,25 +274,39 @@ class Hash2b(K, V)
     size > (1 >> MAX_POWER2_FOR_TABLES_WITHOUT_BINS)
   end
 
-  protected def find_entry(key)
-    # FIXME
-    # index = bucket_index key
-    # entry = @buckets[index]
-    # find_entry_in_bucket entry, key
+  private def allocated_entries
+    1 << entry_power
   end
 
-  private def insert_in_bucket(index, key, value)
+  private def rebuild_table_if_necessary
+    rehash if entries.stops_at == allocated_entries
+    assert(entries.stops_at < allocated_entries)
   end
 
-  private def find_entry_in_bucket(entry, key)
-    # FIXME
-    # while entry
-    #   if entry.key == key
-    #     return entry
-    #   end
-    #   entry = entry.next
-    # end
-    # nil
+  # Insert KEY, VALUE into hash table.
+  # Returns true if new key is inserted, false otherwise.
+  private def insert(key, value)
+    rebuild_table_if_necessary
+    hash = do_hash(key)
+    if !@bins
+      entry_index = entries.index(key, hash)
+      is_new = entry_index == Entries::UNDEFINED
+      @size += 1 if is_new
+      bin_index = Bins::UNDEFINED
+    else
+      entry_index, bin_index = @bins.reserve_index(key, hash, entries)
+      is_new = entry_index == Entries::UNDEFINED
+    end
+    if is_new
+      @entries = Entries.new(entries.entries, entries.starts_at, entries.stops_at + 1)
+      entry_index = entries.stops_at
+      if bin_index != Bins::UNDEFINED
+        bins.not_nil!.set_bin(bin_index, entry_index)
+      end
+    end
+
+    entries[entry_index] = Entry.new(hash, key, value)
+    is_new
   end
 
   MAX_POWER2 = 62
