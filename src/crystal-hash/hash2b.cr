@@ -1,32 +1,38 @@
 class Hash2b(K, V)
-  include Enumerable({K, V})
-  include Iterable({K, V})
+  # include Enumerable({K, V})
+  # include Iterable({K, V})
 
   getter size : Int32
   getter first : Int32?
   getter last : Int32?
 
-  protected getter entries
-  protected getter bins
+  # protected getter entries
+  # protected getter bins
+  # protected getter entry_power
+  # protected getter bin_power
+  # protected getter rebuilds
+  property entries : Entries(K, V)
+  getter bins : Bins(K, V) | Nil
+  getter entry_power : UInt16
+  getter bin_power : UInt8
+  getter rebuilds : Int32
 
-  record(Entry, hash : Int32, key : K, value : V) do
+  record(Entry(K, V), hash : Int32, key : K, value : V) do
     def eq?(o_key : K, o_hash : Int32)
       hash == o_hash && key == o_key
     end
   end
 
-  struct Bins
+  struct Bins(K, V)
     EMPTY     = 0
     DELETED   = 1
     BASE      = 2
     UNDEFINED = ~0
 
-    ENTRY_BASE = 2
-
     property bins : Slice(Int32)
 
     def initialize(size)
-      @bins = Slice(Int32).new(initial_capacity, EMPTY)
+      @bins = Slice(Int32).new(size, EMPTY)
     end
 
     def empty?(i : Int32)
@@ -53,11 +59,11 @@ class Hash2b(K, V)
 
     # TODO: ruby version uses variable index sizes depending on size
     # of bin table. Should that be done here as well?
-    def set_bin(n, v, offset = ENTRY_BASE)
+    def set_bin(n, v, offset = BASE)
       bins[n] = v + offset
     end
 
-    def get_bin(n, offset = ENTRY_BASE)
+    def get_bin(n, offset = BASE)
       bins[n] - offset
     end
 
@@ -74,21 +80,23 @@ class Hash2b(K, V)
     end
 
     def clear
-      @bins.clear
+      @bins.each_with_index do |_, i|
+        @bins[i] = EMPTY
+      end
     end
 
     # Find index of bin and entry for key and hash. If there is no such bin,
     # return {Bin::UNDEFINED, Entries::UNDEFINED}
-    def index(key : K, hash : Int32, entries : Entries)
+    def index(key : K, hash : Int32, entries : Entries(K, V))
       index = bin_hash(hash)
       perturb = hash
       loop do
         if !empty_or_deleted?(index)
           entry_index = get_bin(index)
           entry = entries[entry_index]
-          return {entry_index, index} if entry.eq?(hash, key)
+          return {bin: index, entries: entry_index} if entry.eq?(key, hash)
         elsif empty?(index)
-          return {bin: Bin::UNDEFINED, entries: Entries::UNDEFINED}
+          return {bin: Bins::UNDEFINED, entries: Entries::UNDEFINED}
         end
         index, perturb = secondary_hash(index, perturb)
       end
@@ -97,6 +105,9 @@ class Hash2b(K, V)
     # Finds the next unused index for key.
     def unused_index(key : K, hash : Int32, entries : Entries)
       index = bin_hash(hash)
+      if entries.allocated_size > bins.size
+        raise "bins too small!"
+      end
       perturb = hash
       until empty_or_deleted?(index)
         index, perturb = secondary_hash(index, perturb)
@@ -118,7 +129,6 @@ class Hash2b(K, V)
       loop do
         entry_index = get_bin(index)
         if empty?(index)
-          # num_entries++ ? Need @size
           entry_index = Entries::UNDEFINED
           if first_deleted != UNDEFINED
             # we can reuse a deleted index
@@ -135,6 +145,12 @@ class Hash2b(K, V)
         end
         index, perturb = secondary_hash(index, perturb)
       end
+    end
+
+    def insert!(entry, index, new_entries)
+      bin_index = unused_index(entry.key, entry.hash, new_entries)
+      raise "Invalid bin_index" unless bin_index != Bins::UNDEFINED && empty?(bin_index)
+      set_bin(bin_index, index)
     end
 
     # Return the next secondary hash index for table TAB using previous
@@ -154,20 +170,25 @@ class Hash2b(K, V)
     end
   end
 
-  struct Entries
-    property entries : Slice(Entry)
+  struct Entries(K, V)
+    property entries : Slice(Entry(K, V))
     property starts_at
     property stops_at
 
     UNDEFINED = ~0
 
     def initialize(size)
-      @entries = Slice(Entry).new(size)
+      key = uninitialized K
+      value = uninitialized V
+      hash = UNDEFINED
+      entry = Entry.new(hash, key, value)
+
+      @entries = Slice(Entry(K, V)).new(size, entry)
       @starts_at = 0
       @stops_at = 0
     end
 
-    def initialize(@entries, @starts_at, @stops_at)
+    def initialize(@entries : Slice(Entry(K, V)), @starts_at, @stops_at)
     end
 
     def mark_deleted(i)
@@ -178,26 +199,24 @@ class Hash2b(K, V)
       entries[i].hash == RESERVED_HASH_VALUE
     end
 
-    def size
-      # FIXME
-      entries.size
-    end
-
     def clear
       @starts_at = @stops_at = 0
     end
 
     # linear search, used for small tables.
     def index(hash, key)
-      starts_at.upto(stops_at) do |i|
+      starts_at.upto(stops_at - 1) do |i|
         return i if entries[i].eq?(hash, key)
       end
       UNDEFINED
     end
 
-    def each
+    def each_with_index
       starts_at.upto(stops_at) do |i|
-        yield entries[i] unless deleted?(i)
+        val = {entries[i], i}
+        unless deleted?(i)
+          yield val
+        end
       end
     end
 
@@ -208,6 +227,22 @@ class Hash2b(K, V)
     def []=(i, entry : Entry)
       entries[i] = entry
     end
+
+    def copy_to(other_or_self)
+      new_index = 0
+      starts_at.upto(stops_at - 1) do |i|
+        next if deleted?(i)
+        other_or_self[new_index] = entries[i]
+        new_index += 1
+      end
+      other_or_self.starts_at = 0
+      other_or_self.stops_at = new_index
+      other_or_self
+    end
+
+    def allocated_size
+      entries.size
+    end
   end
 
   def initialize(block : (Hash(K, V), K -> V)? = nil, initial_capacity = 0)
@@ -215,13 +250,13 @@ class Hash2b(K, V)
     @rebuilds = 0
     @entry_power = power2(initial_capacity)
     @bin_power = feature.bin_power
-    if n <= MAX_POWER2_FOR_TABLES_WITHOUT_BINS
+    if @entry_power <= MAX_POWER2_FOR_TABLES_WITHOUT_BINS
       @bins = nil
     else
-      @bins = Bins.new(feature.bins_words)
+      @bins = Bins(K, V).new(feature.bin_words)
     end
 
-    @entries = Entries.new(allocated_entries)
+    @entries = Entries(K, V).new(allocated_entries)
   end
 
   private def lookup(key : K)
@@ -231,9 +266,9 @@ class Hash2b(K, V)
             else
               entries.index(key, hash)
             end
-    found = index == Entries::UNDEFINED
-    entry = found ? nil : entries[index]
-    {found, entry.value}
+    found = index != Entries::UNDEFINED
+    entry = found ? entries[index] : nil
+    {found, entry && entry.value}
   end
 
   private def make_empty
@@ -249,25 +284,34 @@ class Hash2b(K, V)
   end
 
   def rehash
-    bound = entries.stops_at
-    if (2 * size <= allocated_entries &&
-       REBUILD_THRESHOLD * @size > allocated_entries) ||
-       @size < 1 << MINIMAL_POWER2
+    puts "rebuilding at size #{@size}"
+    if ((2 * size <= allocated_entries &&
+       REBUILD_THRESHOLD * size > allocated_entries) ||
+       size < (1 << MINIMAL_POWER2))
       # compaction
-      @size = 0
-      @bins.clear if @bins
+      bins = @bins
+      bins.clear if bins
       new_tab = self
-      new_entries = entries
     else
-      new_tab = self.class.new(nil, 2 * @size - 1)
-      new_entries = new_tab.entries
+      new_tab = self.class.new(nil, 2 * size - 1)
     end
-    new_index = 0
-    bins = new_hash.bins
-    entries.starts_at.upto(bound) do |i|
-      entry = entries[i]
-      entries
+    bins = new_tab.bins
+    new_tab.entries = entries.copy_to(new_tab.entries)
+    if bins
+      new_tab.entries.each_with_index do |entry, index|
+        bins.insert!(entry, index, new_tab.entries)
+      end
     end
+
+    if new_tab != self
+      @entry_power = new_tab.entry_power
+      @bin_power = new_tab.bin_power
+      @bins = new_tab.bins
+      @entries = new_tab.entries
+    end
+    raise "invalid size" unless @size == entries.stops_at
+
+    @rebuilds += 1
   end
 
   private def bin_table?(size)
@@ -280,7 +324,25 @@ class Hash2b(K, V)
 
   private def rebuild_table_if_necessary
     rehash if entries.stops_at == allocated_entries
-    assert(entries.stops_at < allocated_entries)
+    raise "invalid stops_at" unless entries.stops_at < allocated_entries
+  end
+
+  def [](key)
+    found, val = lookup(key)
+    unless found
+      raise KeyError.new "Missing hash key: #{key.inspect}"
+    end
+    val
+  end
+
+  def []?(key)
+    _, val = lookup(key)
+    val
+  end
+
+  def []=(key, value)
+#    puts "Inserting #{key.to_s} : #{value.to_s}"
+    insert(key, value)
   end
 
   # Insert KEY, VALUE into hash table.
@@ -288,35 +350,39 @@ class Hash2b(K, V)
   private def insert(key, value)
     rebuild_table_if_necessary
     hash = do_hash(key)
-    if !@bins
+    bins = @bins
+    if bins
+      entry_index, bin_index = bins.reserve_index(key, hash, entries)
+      is_new = entry_index == Entries::UNDEFINED
+    else
       entry_index = entries.index(key, hash)
       is_new = entry_index == Entries::UNDEFINED
-      @size += 1 if is_new
       bin_index = Bins::UNDEFINED
-    else
-      entry_index, bin_index = @bins.reserve_index(key, hash, entries)
-      is_new = entry_index == Entries::UNDEFINED
     end
     if is_new
-      @entries = Entries.new(entries.entries, entries.starts_at, entries.stops_at + 1)
+      @size += 1
       entry_index = entries.stops_at
+      @entries = Entries.new(entries.entries, entries.starts_at, entries.stops_at + 1)
+
       if bin_index != Bins::UNDEFINED
         bins.not_nil!.set_bin(bin_index, entry_index)
       end
     end
 
+    # p "inserting into entry_index #{entry_index}"
+    # p @size
     entries[entry_index] = Entry.new(hash, key, value)
     is_new
   end
 
-  MAX_POWER2 = 62
+  MAX_POWER2 = 30u16
 
   # Power of 2 defining minimal number of allocated entries
-  MINIMAL_POWER2 = 2
+  MINIMAL_POWER2 = 2u16
 
   # If power2 of allocated entries is less than this, don't allocate a
   # bins table and use linear search instead.
-  MAX_POWER2_FOR_TABLES_WITHOUT_BINS = 4
+  MAX_POWER2_FOR_TABLES_WITHOUT_BINS = 4u16
 
   # Return smallest n >= MINIMAL_POWER2 such 2^n > size
   # Could use LLVM builtin llvm-clz
@@ -335,11 +401,11 @@ class Hash2b(K, V)
 
   # Reserved hash values are used for deleted entries. Substitute with
   # a different value:
-  RESERVED_HASH_VAL              = ~0
-  RESERVED_HASH_SUBSTITUITON_VAL = 0
+  RESERVED_HASH_VALUE              = ~0
+  RESERVED_HASH_SUBSTITUTION_VALUE = 0
   private def do_hash(key : K)
     hash = key.hash
-    hash == RESERVERD_HASH_VAL ? RESERVED_HASH_SUBSTITUTION_VAL : hash
+    hash == RESERVED_HASH_VALUE ? RESERVED_HASH_SUBSTITUTION_VALUE : hash
   end
 
   REBUILD_THRESHOLD = 4
@@ -348,70 +414,71 @@ class Hash2b(K, V)
     FEATURES[@entry_power]
   end
 
-  record(Feature, entry_power : UInt8, bin_power : UInt8, bins_words : UInt64)
+  record(Feature, entry_power : UInt8, bin_power : UInt8, bin_words : Int32)
+  # Not certain this table make sense now that there isn't a variable bin index size.
   FEATURES = [
-    {0, 1, 0x0},
-    {1, 2, 0x1},
-    {2, 3, 0x1},
-    {3, 4, 0x2},
-    {4, 5, 0x4},
-    {5, 6, 0x8},
-    {6, 7, 0x10},
-    {7, 8, 0x20},
-    {8, 9, 0x80},
-    {9, 10, 0x100},
-    {10, 11, 0x200},
-    {11, 12, 0x400},
-    {12, 13, 0x800},
-    {13, 14, 0x1000},
-    {14, 15, 0x2000},
-    {15, 16, 0x4000},
-    {16, 17, 0x10000},
-    {17, 18, 0x20000},
-    {18, 19, 0x40000},
-    {19, 20, 0x80000},
-    {20, 21, 0x100000},
-    {21, 22, 0x200000},
-    {22, 23, 0x400000},
-    {23, 24, 0x800000},
-    {24, 25, 0x1000000},
-    {25, 26, 0x2000000},
-    {26, 27, 0x4000000},
-    {27, 28, 0x8000000},
-    {28, 29, 0x10000000},
-    {29, 30, 0x20000000},
-    {30, 31, 0x40000000},
-    {31, 32, 0x80000000},
-    {32, 33, 0x200000000},
-    {33, 34, 0x400000000},
-    {34, 35, 0x800000000},
-    {35, 36, 0x1000000000},
-    {36, 37, 0x2000000000},
-    {37, 38, 0x4000000000},
-    {38, 39, 0x8000000000},
-    {39, 40, 0x10000000000},
-    {40, 41, 0x20000000000},
-    {41, 42, 0x40000000000},
-    {42, 43, 0x80000000000},
-    {43, 44, 0x100000000000},
-    {44, 45, 0x200000000000},
-    {45, 46, 0x400000000000},
-    {46, 47, 0x800000000000},
-    {47, 48, 0x1000000000000},
-    {48, 49, 0x2000000000000},
-    {49, 50, 0x4000000000000},
-    {50, 51, 0x8000000000000},
-    {51, 52, 0x10000000000000},
-    {52, 53, 0x20000000000000},
-    {53, 54, 0x40000000000000},
-    {54, 55, 0x80000000000000},
-    {55, 56, 0x100000000000000},
-    {56, 57, 0x200000000000000},
-    {57, 58, 0x400000000000000},
-    {58, 59, 0x800000000000000},
-    {59, 60, 0x1000000000000000},
-    {60, 61, 0x2000000000000000},
-    {61, 62, 0x4000000000000000},
-    {62, 63, 0x8000000000000000},
-  ].map { |t| Feature.new(*t) }
+    {0_u8, 1_u8},
+    {1_u8, 2_u8},
+    {2_u8, 3_u8},
+    {3_u8, 4_u8},
+    {4_u8, 5_u8},
+    {5_u8, 6_u8},
+    {6_u8, 7_u8},
+    {7_u8, 8_u8},
+    {8_u8, 9_u8},
+    {9_u8, 10_u8},
+    {10_u8, 11_u8},
+    {11_u8, 12_u8},
+    {12_u8, 13_u8},
+    {13_u8, 14_u8},
+    {14_u8, 15_u8},
+    {15_u8, 16_u8},
+    {16_u8, 17_u8},
+    {17_u8, 18_u8},
+    {18_u8, 19_u8},
+    {19_u8, 20_u8},
+    {20_u8, 21_u8},
+    {21_u8, 22_u8},
+    {22_u8, 23_u8},
+    {23_u8, 24_u8},
+    {24_u8, 25_u8},
+    {25_u8, 26_u8},
+    {26_u8, 27_u8},
+    {27_u8, 28_u8},
+    {28_u8, 29_u8},
+    {29_u8, 30_u8},
+    {30_u8, 31_u8},
+    # {31_u8, 32_u8},
+    # {32_u8, 33_u8},
+    # {33_u8, 34_u8, 0x400000000_i32},
+    # {34_u8, 35_u8, 0x800000000_i32},
+    # {35_u8, 36_u8, 0x1000000000_i32},
+    # {36_u8, 37_u8, 0x2000000000_i32},
+    # {37_u8, 38_u8, 0x4000000000_i32},
+    # {38_u8, 39_u8, 0x8000000000_i32},
+    # {39_u8, 40_u8, 0x10000000000_i32},
+    # {40_u8, 41_u8, 0x20000000000_i32},
+    # {41_u8, 42_u8, 0x40000000000_i32},
+    # {42_u8, 43_u8, 0x80000000000_i32},
+    # {43_u8, 44_u8, 0x100000000000_i32},
+    # {44_u8, 45_u8, 0x200000000000_i32},
+    # {45_u8, 46_u8, 0x400000000000_i32},
+    # {46_u8, 47_u8, 0x800000000000_i32},
+    # {47_u8, 48_u8, 0x1000000000000_i32},
+    # {48_u8, 49_u8, 0x2000000000000_i32},
+    # {49_u8, 50_u8, 0x4000000000000_i32},
+    # {50_u8, 51_u8, 0x8000000000000_i32},
+    # {51_u8, 52_u8, 0x10000000000000_i32},
+    # {52_u8, 53_u8, 0x20000000000000_i32},
+    # {53_u8, 54_u8, 0x40000000000000_i32},
+    # {54_u8, 55_u8, 0x80000000000000_i32},
+    # {55_u8, 56_u8, 0x100000000000000_i32},
+    # {56_u8, 57_u8, 0x200000000000000_i32},
+    # {57_u8, 58_u8, 0x400000000000000_i32},
+    # {58_u8, 59_u8, 0x800000000000000_i32},
+    # {59_u8, 60_u8, 0x1000000000000000_i32},
+    # {60_u8, 61_u8, 0x2000000000000000_i32},
+    # {61_u8, 62_u8, 0x4000000000000000_i32},
+    # {62_u8, 63_u8, 0x8000000000000000_i32},
+  ].map { |entry_power, bin_power| Feature.new(entry_power, bin_power, 1 << bin_power) }
 end
