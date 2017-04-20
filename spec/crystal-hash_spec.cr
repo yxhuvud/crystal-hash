@@ -58,4 +58,74 @@ describe Crystal::Hash do
       hsh[c].should eq i * 2
     end
   end
+
+  # it "many entries" do
+  #   hsh = Hash(Int32, Int32).new(nil)
+  #   (1..100_000_000).each do |i|
+  #     hsh[i] = i
+  #   end
+
+  #   (1..100_000_000).each do |i|
+  #     hsh[i].should eq i
+  #   end
+  # end
+
+  it "many hashes" do
+    times = 100_00000
+    arr = Array(Hash2b(Int32, Int32)).new(times)
+
+    size = 10
+    0.upto(times) do
+      hsh = Hashb(Int32, Int32).new nil, size
+      arr << hsh
+      size.times do |i|
+        hsh[i] = i
+      end
+    end
+    valid = true
+    0.upto(times) do |l|
+      size.times do |i|
+        valid &&= (arr[l][i] == i)
+      end
+    end
+    valid.should be_true
+  end
+
+  it "deletes" do
+    hsh = Hash2b(Int32, Int32).new
+    hsh[1] = 42
+    hsh.size.should eq 1
+
+    hsh.delete(5).should be_nil
+    hsh.size.should eq 1
+
+    hsh.delete(1).should eq 42
+    expect_raises do
+      hsh[1]
+    end
+    hsh[1]?.should be_nil
+    hsh.size.should eq 0
+
+    hsh.delete(1).should eq nil
+    hsh.size.should eq 0
+  end
+
+  # it "deletes en masse" do
+  #   hsh = Hash2b(Int32, Int32).new(nil)
+  #   (1..10_000_000).each do |i|
+  #     hsh[i] = i
+  #   end
+
+  #   (1..10_000_000).each do |i|
+  #     hsh.delete(i).should eq i
+  #   end
+
+  #   (1..10_000_000).each do |i|
+  #     hsh[2*i] = i
+  #   end
+
+  #   (1..10_000_000).each do |i|
+  #     hsh.delete(2*i).should eq i
+  #   end
+  # end
 end

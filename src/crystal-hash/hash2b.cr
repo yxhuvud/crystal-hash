@@ -48,8 +48,9 @@ class Hash2b(K, V)
     end
 
     def mark_deleted(i : Int32)
-      assert i != UNDEFINED
-      assert !empty_or_deleted?(i)
+      raise "Invalid bin index" if i == UNDEFINED
+      raise "entry is already empty or deleted" if empty_or_deleted?(i)
+
       set_bin(i, DELETED, 0)
     end
 
@@ -58,7 +59,8 @@ class Hash2b(K, V)
     end
 
     # TODO: ruby version uses variable index sizes depending on size
-    # of bin table. Should that be done here as well?
+    # of bin table. Should that be done here as well? That will
+    # complicate a lot of places..
     def set_bin(n, v, offset = BASE)
       bins[n] = v + offset
     end
@@ -192,7 +194,13 @@ class Hash2b(K, V)
     end
 
     def mark_deleted(i)
-      entries[i].hash = RESERVED_HASH_VALUE
+      entries[i] = Entry.new(RESERVED_HASH_VALUE, entries[i].key, entries[i].value)
+      # do not update stops_at here as that would make it possible to
+      # fill table before rebuiling.
+      if @starts_at == i
+        @starts_at += 1
+      end
+      self
     end
 
     def deleted?(i)
@@ -212,11 +220,9 @@ class Hash2b(K, V)
     end
 
     def each_with_index
-      starts_at.upto(stops_at) do |i|
+      starts_at.upto(stops_at - 1) do |i|
         val = {entries[i], i}
-        unless deleted?(i)
-          yield val
-        end
+        yield val unless deleted?(i)
       end
     end
 
@@ -261,11 +267,11 @@ class Hash2b(K, V)
 
   private def lookup(key : K)
     hash = do_hash(key)
-    index = if (bins = @bins)
-              bins.index(key, hash, entries)[:entries]
-            else
-              entries.index(key, hash)
-            end
+    if (bins = @bins)
+      index = bins.index(key, hash, entries)[:entries]
+    else
+      index = entries.index(key, hash)
+    end
     found = index != Entries::UNDEFINED
     entry = found ? entries[index] : nil
     {found, entry && entry.value}
@@ -284,7 +290,6 @@ class Hash2b(K, V)
   end
 
   def rehash
-    puts "rebuilding at size #{@size}"
     if ((2 * size <= allocated_entries &&
        REBUILD_THRESHOLD * size > allocated_entries) ||
        size < (1 << MINIMAL_POWER2))
@@ -293,8 +298,9 @@ class Hash2b(K, V)
       bins.clear if bins
       new_tab = self
     else
+      # expansion
       new_tab = self.class.new(nil, 2 * size - 1)
-    end
+#    end
     bins = new_tab.bins
     new_tab.entries = entries.copy_to(new_tab.entries)
     if bins
@@ -341,7 +347,6 @@ class Hash2b(K, V)
   end
 
   def []=(key, value)
-#    puts "Inserting #{key.to_s} : #{value.to_s}"
     insert(key, value)
   end
 
@@ -369,10 +374,26 @@ class Hash2b(K, V)
       end
     end
 
-    # p "inserting into entry_index #{entry_index}"
-    # p @size
     entries[entry_index] = Entry.new(hash, key, value)
     is_new
+  end
+
+  def delete(key)
+    hash = do_hash(key)
+    bins = @bins
+    if bins
+      indices = bins.index(key, hash, entries)
+      entry_index = indices[:entries]
+      return nil if entry_index == Entries::UNDEFINED
+      bins.mark_deleted(indices[:bin])
+    else
+      entry_index = entries.index(key, hash)
+      return nil if entry_index == Entries::UNDEFINED
+    end
+    entry = entries[entry_index]
+    @entries = entries.mark_deleted(entry_index)
+    @size -= 1
+    entry.value
   end
 
   MAX_POWER2 = 30u16
