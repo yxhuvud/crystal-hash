@@ -300,7 +300,7 @@ class Hash2b(K, V)
     else
       # expansion
       new_tab = self.class.new(nil, 2 * size - 1)
-#    end
+    end
     bins = new_tab.bins
     new_tab.entries = entries.copy_to(new_tab.entries)
     if bins
